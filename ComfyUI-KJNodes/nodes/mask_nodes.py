@@ -6,6 +6,7 @@ import scipy.ndimage
 import numpy as np
 from contextlib import nullcontext
 import os
+from tqdm import tqdm
 
 from comfy import model_management
 from comfy.utils import ProgressBar
@@ -17,6 +18,8 @@ import folder_paths
 from ..utility.utility import tensor2pil, pil2tensor
 
 script_directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+main_device = model_management.get_torch_device()
+offload_device = model_management.unet_offload_device()
 
 class BatchCLIPSeg:
 
@@ -997,43 +1000,55 @@ class GrowMaskWithBlur:
 - fill_holes: fill holes in the mask (slow)"""
     
     def expand_mask(self, mask, expand, tapered_corners, flip_input, blur_radius, incremental_expandrate, lerp_alpha, decay_factor, fill_holes=False):
+        import kornia.morphology as morph
         alpha = lerp_alpha
         decay = decay_factor
         if flip_input:
             mask = 1.0 - mask
-        c = 0 if tapered_corners else 1
-        kernel = np.array([[c, 1, c],
-                           [1, 1, 1],
-                           [c, 1, c]])
-        growmask = mask.reshape((-1, mask.shape[-2], mask.shape[-1])).cpu()
+
+        growmask = mask.reshape((-1, mask.shape[-2], mask.shape[-1]))
         out = []
         previous_output = None
         current_expand = expand
-        for m in growmask:
-            output = m.numpy().astype(np.float32)
-            for _ in range(abs(round(current_expand))):
-                if current_expand < 0:
-                    output = scipy.ndimage.grey_erosion(output, footprint=kernel)
+        for m in tqdm(growmask, desc="Expanding/Contracting Mask"):
+            output = m.unsqueeze(0).unsqueeze(0).to(main_device)  # Add batch and channel dims for kornia
+            if abs(round(current_expand)) > 0:
+                # Create kernel - kornia expects kernel on same device as input
+                if tapered_corners:
+                    kernel = torch.tensor([[0, 1, 0],
+                                        [1, 1, 1],
+                                        [0, 1, 0]], dtype=torch.float32, device=output.device)
                 else:
-                    output = scipy.ndimage.grey_dilation(output, footprint=kernel)
+                    kernel = torch.tensor([[1, 1, 1],
+                                        [1, 1, 1],
+                                        [1, 1, 1]], dtype=torch.float32, device=output.device)
+                
+                for _ in range(abs(round(current_expand))):
+                    if current_expand < 0:
+                        output = morph.erosion(output, kernel)
+                    else:
+                        output = morph.dilation(output, kernel)
+            
+            output = output.squeeze(0).squeeze(0)  # Remove batch and channel dims
+            
             if current_expand < 0:
                 current_expand -= abs(incremental_expandrate)
             else:
                 current_expand += abs(incremental_expandrate)
+                
             if fill_holes:
                 binary_mask = output > 0
-                output = scipy.ndimage.binary_fill_holes(binary_mask)
-                output = output.astype(np.float32) * 255
-            output = torch.from_numpy(output)
+                output_np = binary_mask.cpu().numpy()
+                filled = scipy.ndimage.binary_fill_holes(output_np)
+                output = torch.from_numpy(filled.astype(np.float32)).to(output.device)
+            
             if alpha < 1.0 and previous_output is not None:
-                # Interpolate between the previous and current frame
                 output = alpha * output + (1 - alpha) * previous_output
             if decay < 1.0 and previous_output is not None:
-                # Add the decayed previous output to the current frame
                 output += decay * previous_output
                 output = output / output.max()
             previous_output = output
-            out.append(output)
+            out.append(output.cpu())
 
         if blur_radius != 0:
             # Convert the tensor list to PIL images, apply blur, and convert back
@@ -1502,3 +1517,153 @@ class ConsolidateMasksKJ:
         print(f"Consolidated {B} masks into {len(final_masks)}")
         return (torch.stack(final_masks, dim=0),)
 
+
+class DrawMaskOnImage:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "image": ("IMAGE", ),
+                    "mask": ("MASK", ),
+                    "color": ("STRING", {"default": "0, 0, 0", "tooltip": "Color as RGB values in range 0-255 or 0.0-1.0, separated by commas."}),
+                  },
+                  "optional": {
+                    "device": (["cpu", "gpu"], {"default": "cpu", "tooltip": "Device to use for processing"}),
+                }
+        }
+    
+    RETURN_TYPES = ("IMAGE", )
+    RETURN_NAMES = ("images",)
+    FUNCTION = "apply"
+    CATEGORY = "KJNodes/masking"
+    DESCRIPTION = "Applies the provided masks to the input images."
+
+    def apply(self, image, mask, color, device="cpu"):
+        B, H, W, C = image.shape
+        BM, HM, WM = mask.shape
+
+        processing_device = main_device if device == "gpu" else torch.device("cpu")
+
+        in_masks = mask.clone().to(processing_device)
+        in_images = image.clone().to(processing_device)
+        
+        if HM != H or WM != W:
+            in_masks = F.interpolate(mask.unsqueeze(1), size=(H, W), mode='nearest-exact').squeeze(1)
+        if B > BM:
+            in_masks = in_masks.repeat((B + BM - 1) // BM, 1, 1)[:B]
+        elif BM > B:
+            in_masks = in_masks[:B]
+        
+        output_images = []
+        
+        # Parse background color - detect if values are integers or floats
+        bg_values = []
+        for x in color.split(","):
+            val_str = x.strip()
+            if '.' in val_str:
+                bg_values.append(float(val_str))
+            else:
+                bg_values.append(int(val_str) / 255.0)
+
+        background_color = torch.tensor(bg_values, dtype=torch.float32, device=in_images.device)
+
+        for i in tqdm(range(B), desc="DrawMaskOnImage batch"):
+            curr_mask = in_masks[i]
+            img_idx = min(i, B - 1)
+            curr_image = in_images[img_idx]
+            mask_expanded = curr_mask.unsqueeze(-1).expand(-1, -1, 3)
+            masked_image = curr_image * (1 - mask_expanded) + background_color * (mask_expanded)
+            output_images.append(masked_image)
+        
+        # If no masks were processed, return empty tensor
+        if not output_images:
+            return (torch.zeros((0, H, W, 3), dtype=image.dtype),)
+
+        out_rgb = torch.stack(output_images, dim=0).cpu()
+        
+        return (out_rgb, )
+
+
+class BlockifyMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "masks": ("MASK",),
+                    "block_size": ("INT", {"default": 32, "min": 8, "max": 512, "step": 1, "tooltip": "Size of blocks in pixels (smaller = smaller blocks)"}),
+                },
+                "optional": {
+                    "device": (["cpu", "gpu"], {"default": "cpu", "tooltip": "Device to use for processing"}),
+                }
+        }
+
+    RETURN_TYPES = ("MASK", )
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "process"
+    CATEGORY = "KJNodes/masking"
+    DESCRIPTION = "Creates a block mask by dividing the bounding box of each mask into blocks of the specified size and filling in blocks that contain any part of the original mask."
+
+    def process(self, masks, block_size, device="cpu"):
+        processing_device = main_device if device == "gpu" else torch.device("cpu")
+        
+        masks = masks.to(processing_device)
+        batch_size, height, width = masks.shape
+        
+        result_masks = torch.zeros_like(masks)
+        
+        for i in tqdm(range(batch_size), desc="BlockifyMask batch"):
+            mask = masks[i]
+            
+            # Find bounding box efficiently
+            mask_bool = mask > 0
+            if not mask_bool.any():
+                continue
+                
+            y_indices = torch.nonzero(mask_bool.any(dim=1), as_tuple=True)[0]
+            x_indices = torch.nonzero(mask_bool.any(dim=0), as_tuple=True)[0]
+            
+            if len(y_indices) == 0 or len(x_indices) == 0:
+                continue
+                
+            y_min, y_max = y_indices[0], y_indices[-1]
+            x_min, x_max = x_indices[0], x_indices[-1]
+            
+            bbox_width = x_max - x_min + 1
+            bbox_height = y_max - y_min + 1
+            
+            # Calculate block grid
+            w_divisions = max(1, bbox_width // block_size)
+            h_divisions = max(1, bbox_height // block_size)
+            
+            w_slice = bbox_width // w_divisions
+            h_slice = bbox_height // h_divisions
+            
+            # Create coordinate grids only for bbox region
+            y_coords = torch.arange(y_min, y_max + 1, device=processing_device).view(-1, 1)
+            x_coords = torch.arange(x_min, x_max + 1, device=processing_device).view(1, -1)
+            
+            # Calculate block indices for bbox region
+            w_block_indices = (x_coords - x_min) // w_slice
+            h_block_indices = (y_coords - y_min) // h_slice
+            
+            # Clamp to valid range
+            w_block_indices = w_block_indices.clamp(0, w_divisions - 1)
+            h_block_indices = h_block_indices.clamp(0, h_divisions - 1)
+            
+            # Create unique block IDs by combining h and w indices
+            block_ids = h_block_indices * w_divisions + w_block_indices
+            
+            # Get mask region within bbox
+            mask_region = mask[y_min:y_max+1, x_min:x_max+1]
+            
+            # Find which blocks have content using scatter_add
+            max_blocks = h_divisions * w_divisions
+            block_content = torch.zeros(max_blocks, device=processing_device)
+            block_content.scatter_add_(0, block_ids.flatten(), mask_region.flatten())
+            
+            # Create result for blocks that have content
+            has_content = block_content > 0
+            block_mask = has_content[block_ids]
+            
+            # Fill the result
+            result_masks[i, y_min:y_max+1, x_min:x_max+1] = block_mask.float()
+        
+        return (result_masks.clamp(0, 1),)
